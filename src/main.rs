@@ -1,10 +1,11 @@
-use futures::{SinkExt, TryStreamExt};
+use std::collections::HashMap;
+
+use futures::{future::select_all, FutureExt, SinkExt, TryStreamExt};
 use tokio::{
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     select,
-    sync::broadcast::{self, Sender},
 };
-
 use tokio_util::codec::{Framed, LinesCodec};
 
 fn build_login_msg(port: u16) -> String {
@@ -15,50 +16,72 @@ fn build_message_msg(port: u16, content: String) -> String {
     format!("MESSAGE:{port} {content}")
 }
 
-async fn handle_new_connection(sock: TcpStream, port: u16, tx: Sender<(u16, String)>) {
-    // including tokio_util as a dependency for better quality codecs.
-    //
-    // this gives greater flexbility for changing the message format if needed
-    // and is always cancellation safe.
-    let codec = LinesCodec::new_with_max_length(8192);
-    let mut sock = Framed::new(sock, codec);
-    let mut rx = tx.subscribe();
-
-    sock.send(build_login_msg(port)).await.unwrap();
-
-    loop {
-        select! {
-            Ok(Some(msg)) = sock.try_next() => {
-                eprintln!("message {port} {msg}");
-                tx.send((port, msg)).unwrap();
-            }
-            Ok((port_recv, msg)) = rx.recv() => {
-                if port_recv != port {
-                    sock.send(build_message_msg(port_recv, msg)).await.unwrap();
-                }
-            }
-        }
-    }
+enum SelectResult {
+    NewConnection((u16, TcpStream)),
+    NewMessage((u16, String)),
+    ClientDisconnected(u16),
 }
 
 #[tokio::main]
 async fn main() {
     const LISTEN_ADDR: &str = "localhost:8888";
-    const BROADCAST_CHANNEL_CAP: usize = 128;
+
+    let mut connections: HashMap<u16, Framed<TcpStream, LinesCodec>> = HashMap::new();
 
     let listener = TcpListener::bind(LISTEN_ADDR).await.unwrap();
-    let (tx, _rx) = broadcast::channel(BROADCAST_CHANNEL_CAP);
 
     eprintln!("started listening on {LISTEN_ADDR}");
 
     loop {
-        let Ok((sock, addr)) = listener.accept().await else {
-            continue;
+        let res = if connections.is_empty() {
+            if let Ok((sock, addr)) = listener.accept().await {
+                SelectResult::NewConnection((addr.port(), sock))
+            } else {
+                continue;
+            }
+        } else {
+            let new_msg_task = select_all(
+                connections
+                    .iter_mut()
+                    .map(|(port, c)| async move { (port, c.try_next().await) }.boxed()),
+            );
+
+            select! {
+                Ok((mut sock, addr)) = listener.accept() => {
+                    sock.write_all(build_login_msg(addr.port()).as_bytes()).await.unwrap();
+                    SelectResult::NewConnection((addr.port(), sock))
+                }
+
+                ((port, msg), _, _) = new_msg_task => {
+                    if let Ok(Some(msg)) = msg {
+                        SelectResult::NewMessage((*port, msg))
+                    } else {
+                        SelectResult::ClientDisconnected(*port)
+                    }
+
+                }
+            }
         };
 
-        eprintln!("connected {addr}");
+        match res {
+            SelectResult::NewConnection((port, c)) => {
+                let codec = LinesCodec::new_with_max_length(8192);
+                let mut framed = Framed::new(c, codec);
+                framed.send(build_login_msg(port)).await.unwrap();
+                let _ = connections.insert(port, framed);
+            }
+            SelectResult::NewMessage((port, m)) => {
+                for (p, c) in connections.iter_mut() {
+                    if *p == port {
+                        continue;
+                    }
 
-        let tx_c = tx.clone();
-        tokio::spawn(handle_new_connection(sock, addr.port(), tx_c));
+                    c.send(build_message_msg(port, m.clone())).await.unwrap();
+                }
+            }
+            SelectResult::ClientDisconnected(port) => {
+                connections.remove(&port);
+            }
+        };
     }
 }
