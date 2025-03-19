@@ -2,17 +2,17 @@ use std::collections::HashMap;
 
 use futures::{future::select_all, FutureExt, SinkExt, TryStreamExt};
 use tokio::{
-    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     select,
 };
+
 use tokio_util::codec::{Framed, LinesCodec};
 
 fn build_login_msg(port: u16) -> String {
     format!("LOGIN:{port}")
 }
 
-fn build_message_msg(port: u16, content: String) -> String {
+fn build_message_msg(port: u16, content: &str) -> String {
     format!("MESSAGE:{port} {content}")
 }
 
@@ -24,10 +24,12 @@ enum Event {
 
 type FramedStream = Framed<TcpStream, LinesCodec>;
 
-async fn handle_event(res: Event, conns: &mut HashMap<u16, FramedStream>) {
-    match res {
+async fn handle_event(event: Event, conns: &mut HashMap<u16, FramedStream>) {
+    const MAX_CODEC_LENGTH: usize = 8192;
+
+    match event {
         Event::NewConnection((port, c)) => {
-            let codec = LinesCodec::new_with_max_length(8192);
+            let codec = LinesCodec::new_with_max_length(MAX_CODEC_LENGTH);
             let mut framed = Framed::new(c, codec);
             framed.send(build_login_msg(port)).await.unwrap();
             let _ = conns.insert(port, framed);
@@ -38,7 +40,8 @@ async fn handle_event(res: Event, conns: &mut HashMap<u16, FramedStream>) {
                     continue;
                 }
 
-                c.send(build_message_msg(port, m.clone())).await.unwrap();
+                // TODO: can factor this out to clone less
+                c.send(build_message_msg(port, &m)).await.unwrap();
             }
         }
         Event::ClientDisconnected(port) => {
@@ -58,6 +61,8 @@ async fn select_next_event(
         return Ok(Event::NewConnection((addr.port(), sock)));
     }
 
+    // TODO: potentially can improve this by not recreating all the tasks
+    // but having issues with select_all holding a mutable reference to the tasks
     let new_msg_task = select_all(
         connections
             .iter_mut()
