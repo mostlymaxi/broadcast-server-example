@@ -87,7 +87,7 @@ async fn select_next_event(
     return Ok(event);
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     const LISTEN_ADDR: &str = "localhost:8888";
 
