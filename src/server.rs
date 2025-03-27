@@ -12,6 +12,8 @@ use tracing::{debug, info, instrument, trace, Level};
 use thiserror::Error;
 
 mod util {
+    pub const MAX_CODEC_LENGTH: usize = 8192;
+
     pub fn build_login_msg(port: u16) -> String {
         format!("LOGIN:{port}")
     }
@@ -66,11 +68,9 @@ async fn handle_event(
     event: Event,
     conns: &mut SelectAll<FramedStreamWrapped>,
 ) -> Result<(), EventError> {
-    const MAX_CODEC_LENGTH: usize = 8192;
-
     match event.kind {
         EventKind::NewConnection(sock) => {
-            let codec = LinesCodec::new_with_max_length(MAX_CODEC_LENGTH);
+            let codec = LinesCodec::new_with_max_length(util::MAX_CODEC_LENGTH);
             let mut framed = Framed::new(sock, codec);
             framed.send(util::build_login_msg(event.port)).await?;
 
