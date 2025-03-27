@@ -43,12 +43,12 @@ pub enum EventError {
     CodecError(#[from] tokio_util::codec::LinesCodecError),
 }
 
-struct FramedStreamWrapped {
-    inner: FramedStream,
+struct FramedStream {
+    inner: Framed<TcpStream, LinesCodec>,
     port: u16,
 }
 
-impl Stream for FramedStreamWrapped {
+impl Stream for FramedStream {
     type Item = Result<(u16, String), LinesCodecError>;
 
     fn poll_next(
@@ -61,20 +61,15 @@ impl Stream for FramedStreamWrapped {
     }
 }
 
-type FramedStream = Framed<TcpStream, LinesCodec>;
-
 #[instrument(level = Level::DEBUG, skip(conns), ret, err(level = Level::ERROR))]
-async fn handle_event(
-    event: Event,
-    conns: &mut SelectAll<FramedStreamWrapped>,
-) -> Result<(), EventError> {
+async fn handle_event(event: Event, conns: &mut SelectAll<FramedStream>) -> Result<(), EventError> {
     match event.kind {
         EventKind::NewConnection(sock) => {
             let codec = LinesCodec::new_with_max_length(util::MAX_CODEC_LENGTH);
             let mut framed = Framed::new(sock, codec);
             framed.send(util::build_login_msg(event.port)).await?;
 
-            let framed = FramedStreamWrapped {
+            let framed = FramedStream {
                 inner: framed,
                 port: event.port,
             };
@@ -102,7 +97,7 @@ async fn handle_event(
 #[instrument(level = Level::DEBUG, skip(conns), ret, err(level = Level::ERROR))]
 async fn select_next_event(
     listener: &TcpListener,
-    conns: &mut SelectAll<FramedStreamWrapped>,
+    conns: &mut SelectAll<FramedStream>,
 ) -> Result<Event, std::io::Error> {
     // select_all will panic if the underlying iterable is empty
     if conns.is_empty() {
