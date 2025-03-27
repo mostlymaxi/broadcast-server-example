@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::pin::Pin;
 
-use futures::{future::select_all, FutureExt, SinkExt, TryStreamExt};
+use futures::{stream::SelectAll, SinkExt, Stream, StreamExt};
 use tokio::{
     net::{TcpListener, TcpStream},
     select,
 };
 
-use tokio_util::codec::{Framed, LinesCodec};
+use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 fn build_login_msg(port: u16) -> String {
     format!("LOGIN:{port}")
@@ -19,12 +19,30 @@ fn build_message_msg(port: u16, content: &str) -> String {
 enum Event {
     NewConnection((u16, TcpStream)),
     NewMessage((u16, String)),
-    ClientDisconnected(u16),
+    // ClientDisconnected(u16),
+}
+
+struct FramedStreamWrapped {
+    inner: FramedStream,
+    port: u16,
+}
+
+impl Stream for FramedStreamWrapped {
+    type Item = Result<(u16, String), LinesCodecError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner)
+            .poll_next(cx)
+            .map_ok(|msg| (self.port, msg))
+    }
 }
 
 type FramedStream = Framed<TcpStream, LinesCodec>;
 
-async fn handle_event(event: Event, conns: &mut HashMap<u16, FramedStream>) {
+async fn handle_event(event: Event, conns: &mut SelectAll<FramedStreamWrapped>) {
     const MAX_CODEC_LENGTH: usize = 8192;
 
     match event {
@@ -32,66 +50,64 @@ async fn handle_event(event: Event, conns: &mut HashMap<u16, FramedStream>) {
             let codec = LinesCodec::new_with_max_length(MAX_CODEC_LENGTH);
             let mut framed = Framed::new(c, codec);
             framed.send(build_login_msg(port)).await.unwrap();
-            let _ = conns.insert(port, framed);
+
+            let framed = FramedStreamWrapped {
+                inner: framed,
+                port,
+            };
+
+            conns.push(framed);
         }
         Event::NewMessage((port, m)) => {
-            for (p, c) in conns.iter_mut() {
-                if *p == port {
+            let msg = build_message_msg(port, &m);
+
+            for connection in conns.iter_mut() {
+                if connection.port == port {
                     continue;
                 }
 
-                // TODO: can factor this out to clone less
-                c.send(build_message_msg(port, &m)).await.unwrap();
+                if connection.inner.send(&msg).await.is_err() {
+                    eprintln!("client {} disconnected", connection.port);
+                }
             }
-        }
-        Event::ClientDisconnected(port) => {
-            conns.remove(&port);
         }
     };
 }
 
 async fn select_next_event(
     listener: &TcpListener,
-    connections: &mut HashMap<u16, FramedStream>,
+    conns: &mut SelectAll<FramedStreamWrapped>,
 ) -> Result<Event, std::io::Error> {
     // select_all will panic if the underlying iterable is empty
-    if connections.is_empty() {
+    if conns.is_empty() {
         let (sock, addr) = listener.accept().await?;
 
         return Ok(Event::NewConnection((addr.port(), sock)));
     }
-
-    // TODO: potentially can improve this by not recreating all the tasks
-    // but having issues with select_all holding a mutable reference to the tasks
-    let new_msg_task = select_all(
-        connections
-            .iter_mut()
-            .map(|(port, c)| async move { (port, c.try_next().await) }.boxed()),
-    );
 
     let event = select! {
         Ok((sock, addr)) = listener.accept() => {
             Event::NewConnection((addr.port(), sock))
         }
 
-        ((port, msg), _, _) = new_msg_task => {
-            if let Ok(Some(msg)) = msg {
-                Event::NewMessage((*port, msg))
+        Some(res) = conns.next() => {
+            if let Ok((port, msg)) = res {
+                Event::NewMessage((port, msg))
             } else {
-                Event::ClientDisconnected(*port)
+                todo!()
             }
 
         }
     };
 
-    return Ok(event);
+    Ok(event)
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     const LISTEN_ADDR: &str = "localhost:8888";
 
-    let mut conns: HashMap<u16, FramedStream> = HashMap::new();
+    let mut conns = SelectAll::new();
 
     let listener = TcpListener::bind(LISTEN_ADDR).await.unwrap();
 
